@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import itertools
 import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
@@ -351,6 +352,8 @@ class VQVAELightning(L.LightningModule):
             self.model = VQVAETransformer(**model_kwargs)
         elif model_type == "VQVAENormFormer":
             self.model = VQVAENormFormer(**model_kwargs)
+        elif model_type == "GraphNet":
+            self.model = VQVAEGraphNet(**model_kwargs)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -875,3 +878,155 @@ def plot_loss(loss_history, lr_history, moving_average=100):
 
     fig.tight_layout()
     plt.show()
+
+
+
+class GraphNetBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, De, Do, n_constituents, activation_idx=0):
+        super().__init__()
+        self.N = n_constituents
+        self.Nr = self.N * (self.N - 1)
+        self.P = input_dim
+        self.De = De
+        self.Do = Do
+        self.hidden = hidden_dim
+
+        self.register_buffer("Rr", torch.zeros(self.N, self.Nr))
+        self.register_buffer("Rs", torch.zeros(self.N, self.Nr))
+        
+        receiver_sender_list = [i for i in itertools.product(range(self.N), range(self.N)) if i[0] != i[1]]
+        for i, (r, s) in enumerate(receiver_sender_list):
+            self.Rr[r, i] = 1
+            self.Rs[s, i] = 1
+
+        activations = [nn.ReLU, nn.ELU, nn.SELU]
+        Act = activations[activation_idx]
+
+        self.fr = nn.Sequential(
+            nn.Linear(2 * self.P, self.hidden),
+            Act(),
+            nn.Linear(self.hidden, int(self.hidden / 2)),
+            Act(),
+            nn.Linear(int(self.hidden / 2), self.De),
+            Act()
+        )
+
+        self.fo = nn.Sequential(
+            nn.Linear(self.P + self.De, self.hidden),
+            Act(),
+            nn.Linear(self.hidden, int(self.hidden / 2)),
+            Act(),
+            nn.Linear(int(self.hidden / 2), self.Do),
+            Act()
+        )
+
+    def forward(self, x, mask=None):
+
+        x_t = x.transpose(1, 2)
+
+        Orr = torch.matmul(x_t, self.Rr) 
+        Ors = torch.matmul(x_t, self.Rs) 
+
+        B = torch.cat([Orr, Ors], dim=1) 
+        B = B.transpose(1, 2).contiguous() 
+
+        E = self.fr(B)
+
+        E = E.transpose(1, 2).contiguous() 
+        Ebar = torch.matmul(E, self.Rr.transpose(0, 1)) 
+        Ebar = Ebar.transpose(1, 2).contiguous()
+
+        # Node update
+        C = torch.cat([x, Ebar], dim=2)
+        O = self.fo(C) 
+
+        if mask is not None:
+            O = O * mask.unsqueeze(-1)
+
+        return O
+
+
+class GraphNetEncode(GraphNetBlock):
+    pass
+
+
+class GraphNetDecode(GraphNetBlock):
+    pass
+
+
+class GraphNetStack(nn.Module):
+    def __init__(self, block_class, hidden_dim, n_constituents, num_blocks=2):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            block_class(
+                input_dim=hidden_dim,
+                hidden_dim=hidden_dim,
+                De=hidden_dim,
+                Do=hidden_dim,
+                n_constituents=n_constituents
+            )
+            for _ in range(num_blocks)
+        ])
+
+    def forward(self, x, mask):
+        for block in self.blocks:
+            x = block(x, mask=mask)
+        return x
+    
+class VQVAEGraphNet(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        latent_dim,
+        hidden_dim,
+        n_constituents,
+        num_blocks=4,
+        vq_kwargs={},
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.loss_history = []
+        self.lr_history = []
+
+        self.vq_kwargs = vq_kwargs
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.n_constituents = n_constituents
+        self.num_blocks = num_blocks
+
+        self.input_projection = nn.Linear(self.input_dim, self.hidden_dim)
+        
+        self.encoder_graphnet = GraphNetStack(
+            block_class=GraphNetEncode,
+            hidden_dim=self.hidden_dim,
+            n_constituents=self.n_constituents,
+            num_blocks=self.num_blocks
+        )
+        
+        self.latent_projection_in = nn.Linear(self.hidden_dim, self.latent_dim)
+        self.vqlayer = VectorQuant(feature_size=self.latent_dim, **vq_kwargs)
+        self.latent_projection_out = nn.Linear(self.latent_dim, self.hidden_dim)
+        
+        self.decoder_graphnet = GraphNetStack(
+            block_class=GraphNetDecode,
+            hidden_dim=self.hidden_dim,
+            n_constituents=self.n_constituents,
+            num_blocks=self.num_blocks
+        )
+        
+        self.output_projection = nn.Linear(self.hidden_dim, self.input_dim)
+
+    def forward(self, x, mask):
+        x = self.input_projection(x)
+        x = self.encoder_graphnet(x, mask=mask)
+        z_embed = self.latent_projection_in(x) * mask.unsqueeze(-1)
+        
+        z, vq_out = self.vqlayer(z_embed)
+        
+        x_reco = self.latent_projection_out(z) * mask.unsqueeze(-1)
+        x_reco = self.decoder_graphnet(x_reco, mask=mask)
+        x_reco = self.output_projection(x_reco) * mask.unsqueeze(-1)
+        
+        return x_reco, vq_out
