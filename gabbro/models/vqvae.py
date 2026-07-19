@@ -386,7 +386,10 @@ class VQVAELightning(L.LightningModule):
         x_particle_reco, vq_out = self.forward(x_particle, mask_particle)
 
         reco_loss = ((x_particle_reco - x_particle) ** 2).mean()
-        alpha = self.hparams["model_kwargs"]["alpha"]
+        try:
+            alpha = self.hparams["model_kwargs"]['alpha']
+        except:
+            raise Exception("Alpha is not set in model kwargs.")
         cmt_loss = vq_out["loss"]
         code_idx = vq_out["q"]
         loss = reco_loss + alpha * cmt_loss
@@ -989,7 +992,8 @@ class VQVAEGraphNet(torch.nn.Module):
         self.loss_history = []
         self.lr_history = []
 
-        self.vq_kwargs = vq_kwargs
+        self.vq_kwargs = dict(vq_kwargs)
+        self.vq_kwargs.setdefault("dim", -1)
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
@@ -1006,7 +1010,7 @@ class VQVAEGraphNet(torch.nn.Module):
         )
         
         self.latent_projection_in = nn.Linear(self.hidden_dim, self.latent_dim)
-        self.vqlayer = VectorQuant(feature_size=self.latent_dim, **vq_kwargs)
+        self.vqlayer = VectorQuant(feature_size=self.latent_dim, **self.vq_kwargs)
         self.latent_projection_out = nn.Linear(self.latent_dim, self.hidden_dim)
         
         self.decoder_graphnet = GraphNetStack(
