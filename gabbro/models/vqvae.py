@@ -929,10 +929,10 @@ class GraphNetBlock(nn.Module):
 
         E = self.fr(edge_inputs)
 
-        Ebar = torch.zeros(B, N, self.De, device=x.device, dtype=x.dtype)
+        Ebar = torch.zeros(B, N, self.De, device=E.device, dtype=E.dtype)
         Ebar.index_add_(1, self.receivers, E)
 
-        C = torch.cat([x, Ebar], dim=-1)
+        C = torch.cat([x.to(E.dtype), Ebar], dim=-1)
         O = self.fo(C)
 
         if mask is not None:
