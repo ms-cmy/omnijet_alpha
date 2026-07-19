@@ -14,6 +14,7 @@ import vector
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from vqtorch.nn import VectorQuant
+from torch.utils.checkpoint import checkpoint
 
 from gabbro.utils.arrays import (
     ak_pad,
@@ -354,6 +355,7 @@ class VQVAELightning(L.LightningModule):
             self.model = VQVAENormFormer(**model_kwargs)
         elif model_type == "GraphNet":
             self.model = VQVAEGraphNet(**model_kwargs)
+            self.model = torch.compile(self.model)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -893,18 +895,13 @@ class GraphNetBlock(nn.Module):
         self.Do = Do
         self.hidden = hidden_dim
 
-        receiver_sender_list = [i for i in itertools.product(range(self.N), range(self.N)) if i[0] != i[1]]
-        receivers = torch.tensor([r for r, s in receiver_sender_list], dtype=torch.long)
-        senders = torch.tensor([s for r, s in receiver_sender_list], dtype=torch.long)
-        
-        self.register_buffer("receivers", receivers)
-        self.register_buffer("senders", senders)
-
         activations = [nn.ReLU, nn.ELU, nn.SELU]
         Act = activations[activation_idx]
 
-        self.fr = nn.Sequential(
-            nn.Linear(2 * self.P, self.hidden),
+        self.edge_proj_r = nn.Linear(self.P, self.hidden, bias=False)
+        self.edge_proj_s = nn.Linear(self.P, self.hidden, bias=True)
+        
+        self.edge_mlp_rest = nn.Sequential(
             Act(),
             nn.Linear(self.hidden, int(self.hidden / 2)),
             Act(),
@@ -923,14 +920,22 @@ class GraphNetBlock(nn.Module):
 
     def forward(self, x, mask=None):
         B, N, P = x.shape
-        Orr = x[:, self.receivers, :]
-        Ors = x[:, self.senders, :]
-        edge_inputs = torch.cat([Orr, Ors], dim=-1)
+        
+        proj_r = self.edge_proj_r(x) 
+        proj_s = self.edge_proj_s(x) 
+        
+        E_hidden = proj_r.unsqueeze(2) + proj_s.unsqueeze(1)
+        
+        E = self.edge_mlp_rest(E_hidden) 
+        
+        diag_mask = ~torch.eye(N, dtype=torch.bool, device=x.device)
+        E = E * diag_mask.unsqueeze(0).unsqueeze(-1)
+        
+        if mask is not None:
+            edge_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
+            E = E * edge_mask.unsqueeze(-1)
 
-        E = self.fr(edge_inputs)
-
-        Ebar = torch.zeros(B, N, self.De, device=E.device, dtype=E.dtype)
-        Ebar.index_add_(1, self.receivers, E)
+        Ebar = E.sum(dim=2)
 
         C = torch.cat([x.to(E.dtype), Ebar], dim=-1)
         O = self.fo(C)
@@ -940,18 +945,16 @@ class GraphNetBlock(nn.Module):
 
         return O
 
-
 class GraphNetEncode(GraphNetBlock):
     pass
-
 
 class GraphNetDecode(GraphNetBlock):
     pass
 
-
 class GraphNetStack(nn.Module):
-    def __init__(self, block_class, hidden_dim, n_constituents, num_blocks=2):
+    def __init__(self, block_class, hidden_dim, n_constituents, num_blocks=2, use_checkpointing=True):
         super().__init__()
+        self.use_checkpointing = use_checkpointing
         self.blocks = nn.ModuleList([
             block_class(
                 input_dim=hidden_dim,
@@ -965,9 +968,12 @@ class GraphNetStack(nn.Module):
 
     def forward(self, x, mask):
         for block in self.blocks:
-            x = block(x, mask=mask)
+            if self.use_checkpointing and self.training:
+                x = checkpoint(block, x, mask, use_reentrant=False)
+            else:
+                x = block(x, mask=mask)
         return x
-    
+
 class VQVAEGraphNet(torch.nn.Module):
     def __init__(
         self,
