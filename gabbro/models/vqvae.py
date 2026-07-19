@@ -355,7 +355,7 @@ class VQVAELightning(L.LightningModule):
             self.model = VQVAENormFormer(**model_kwargs)
         elif model_type == "GraphNet":
             self.model = VQVAEGraphNet(**model_kwargs)
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model, mode="reduce-overhead")
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
