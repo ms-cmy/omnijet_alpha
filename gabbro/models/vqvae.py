@@ -1021,9 +1021,15 @@ class VQVAEGraphNet(torch.nn.Module):
     def forward(self, x, mask):
         x = self.input_projection(x)
         x = self.encoder_graphnet(x, mask=mask)
+        
+        # Shape: [Batch, 128, 4]
         z_embed = self.latent_projection_in(x) * mask.unsqueeze(-1)
         
+        # REMOVED: z_embed = z_embed.transpose(1, 2).contiguous()
+        
         z, vq_out = self.vqlayer(z_embed)
+        
+        # REMOVED: z = z.transpose(1, 2).contiguous()
         
         x_reco = self.latent_projection_out(z) * mask.unsqueeze(-1)
         x_reco = self.decoder_graphnet(x_reco, mask=mask)
