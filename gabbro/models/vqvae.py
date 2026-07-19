@@ -888,19 +888,17 @@ class GraphNetBlock(nn.Module):
     def __init__(self, input_dim, hidden_dim, De, Do, n_constituents, activation_idx=0):
         super().__init__()
         self.N = n_constituents
-        self.Nr = self.N * (self.N - 1)
         self.P = input_dim
         self.De = De
         self.Do = Do
         self.hidden = hidden_dim
 
-        self.register_buffer("Rr", torch.zeros(self.N, self.Nr))
-        self.register_buffer("Rs", torch.zeros(self.N, self.Nr))
-        
         receiver_sender_list = [i for i in itertools.product(range(self.N), range(self.N)) if i[0] != i[1]]
-        for i, (r, s) in enumerate(receiver_sender_list):
-            self.Rr[r, i] = 1
-            self.Rs[s, i] = 1
+        receivers = torch.tensor([r for r, s in receiver_sender_list], dtype=torch.long)
+        senders = torch.tensor([s for r, s in receiver_sender_list], dtype=torch.long)
+        
+        self.register_buffer("receivers", receivers)
+        self.register_buffer("senders", senders)
 
         activations = [nn.ReLU, nn.ELU, nn.SELU]
         Act = activations[activation_idx]
@@ -924,24 +922,18 @@ class GraphNetBlock(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        B, N, P = x.shape
+        Orr = x[:, self.receivers, :]
+        Ors = x[:, self.senders, :]
+        edge_inputs = torch.cat([Orr, Ors], dim=-1)
 
-        x_t = x.transpose(1, 2)
+        E = self.fr(edge_inputs)
 
-        Orr = torch.matmul(x_t, self.Rr) 
-        Ors = torch.matmul(x_t, self.Rs) 
+        Ebar = torch.zeros(B, N, self.De, device=x.device, dtype=x.dtype)
+        Ebar.index_add_(1, self.receivers, E)
 
-        B = torch.cat([Orr, Ors], dim=1) 
-        B = B.transpose(1, 2).contiguous() 
-
-        E = self.fr(B)
-
-        E = E.transpose(1, 2).contiguous() 
-        Ebar = torch.matmul(E, self.Rr.transpose(0, 1)) 
-        Ebar = Ebar.transpose(1, 2).contiguous()
-
-        # Node update
-        C = torch.cat([x, Ebar], dim=2)
-        O = self.fo(C) 
+        C = torch.cat([x, Ebar], dim=-1)
+        O = self.fo(C)
 
         if mask is not None:
             O = O * mask.unsqueeze(-1)
